@@ -177,6 +177,80 @@ def cmd_resume(args: argparse.Namespace) -> int:
         return 1
 
 
+def cmd_batch_run(args: argparse.Namespace) -> int:
+    """Execute bug bounty pipeline against multiple targets."""
+    from core.batch import create_batch_from_cli, ProgressTracker
+
+    print(f"\n{'='*60}")
+    print(f"MASTERMIND BATCH RUN")
+    print(f"{'='*60}\n")
+
+    # Validate inputs
+    if not any([args.targets, args.target_file, args.cidr]):
+        print("[ERROR] Must provide --targets, --target-file, or --cidr")
+        return 1
+
+    try:
+        # Validate hunt directory
+        validated_dir = validate_hunt_dir(args.hunt_dir)
+        print(f"[Security] ✓ Hunt directory: {validated_dir}")
+
+    except ValidationError as e:
+        print(f"[Security] ✗ Validation failed: {e.message}", file=sys.stderr)
+        return 1
+
+    # Create batch processor
+    processor = create_batch_from_cli(
+        targets=args.targets,
+        target_file=args.target_file,
+        cidr=args.cidr,
+        exclude=args.exclude,
+        parallel=args.parallel,
+        hunt_dir=str(validated_dir),
+        depth=args.depth,
+    )
+
+    # Create progress tracker
+    tracker = ProgressTracker(total_targets=0)  # Will update after collection
+    processor.set_progress_callback(tracker.update)
+
+    print(f"Configuration:")
+    print(f"  Parallel jobs: {args.parallel}")
+    print(f"  Depth: {args.depth}")
+    print(f"  Output: {args.output if args.output else 'stdout'}")
+    print("")
+
+    # Run batch processing
+    print("Starting batch processing...\n")
+    summary = processor.run()
+
+    # Display results
+    print(f"\n{'='*60}")
+    print(f"BATCH SUMMARY")
+    print(f"{'='*60}")
+    print(f"Total targets: {summary.total_targets}")
+    print(f"Completed: {summary.completed}")
+    print(f"Failed: {summary.failed}")
+    print(f"Total findings: {summary.total_findings}")
+    print(f"Duration: {summary.completed_at or 'N/A'}")
+    print("")
+
+    if summary.results:
+        print("Results by target:")
+        for result in summary.results:
+            status_symbol = "✓" if result.status == "completed" else "✗"
+            print(f"  {status_symbol} {result.target} - {result.findings_count} findings")
+            if result.error:
+                print(f"      Error: {result.error}")
+
+    # Save summary if requested
+    if args.output:
+        processor.save_summary(args.output)
+        print(f"\nSummary saved to: {args.output}")
+
+    return 0 if summary.failed == 0 else 1
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     """Show the status of an existing hunt."""
     from workflow.state import load_hunt, load_recent_worklog
@@ -311,6 +385,25 @@ def build_parser() -> argparse.ArgumentParser:
     p_run.add_argument("--depth", choices=["standard", "aggressive", "stealth"],
                        default="standard", help="Hunt depth (default: standard)")
 
+    # batch-run (new)
+    p_batch = sub.add_parser("batch-run", help="Run hunt against multiple targets")
+    p_batch.add_argument("--target-file", "-f", type=Path,
+                         help="File containing target URLs (one per line or JSON)")
+    p_batch.add_argument("--targets", "-t", nargs="*",
+                         help="List of target URLs")
+    p_batch.add_argument("--cidr", "-c",
+                         help="CIDR range to expand (e.g., 192.168.1.0/24)")
+    p_batch.add_argument("--exclude", nargs="*",
+                         help="Patterns to exclude from scanning")
+    p_batch.add_argument("--parallel", "-p", type=int, default=3,
+                         help="Number of parallel jobs (default: 3)")
+    p_batch.add_argument("--hunt-dir", "-d", default="./hunt-data",
+                         help="Base hunt directory (default: ./hunt-data)")
+    p_batch.add_argument("--depth", choices=["standard", "aggressive", "stealth"],
+                         default="standard", help="Hunt depth (default: standard)")
+    p_batch.add_argument("--output", "-o", type=Path,
+                         help="Output file for batch results summary (JSON)")
+
     # resume
     p_resume = sub.add_parser("resume", help="Resume an existing hunt")
     p_resume.add_argument("--hunt-dir", "-d", default="./hunt-data",
@@ -339,6 +432,8 @@ def main() -> int:
 
     if args.command == "run":
         return cmd_run(args)
+    elif args.command == "batch-run":
+        return cmd_batch_run(args)
     elif args.command == "resume":
         return cmd_resume(args)
     elif args.command == "status":

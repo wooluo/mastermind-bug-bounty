@@ -119,9 +119,131 @@ class HuntState:
     custom_instructions: str = ""
     created_at: str = ""
     updated_at: str = ""
+    # Agent-friendly helper properties
+    hunt_dir: str = "./hunt-data"
+    js_analysis_meta: JSAnalysisMeta | None = None
+    linkage_pairs: list[UnconsumedPair] = field(default_factory=list)
 
     def touch(self) -> None:
         self.updated_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+    # -----------------------------------------------------------------------
+    # Agent-friendly query methods
+    # -----------------------------------------------------------------------
+
+    def get_unconsumed_critical_pairs(self) -> list[UnconsumedPair]:
+        """Get unconsumed value-endpoint pairs with CRITICAL priority."""
+        return [p for p in self.linkage_pairs
+                if p.priority == "CRITICAL" and
+                (p.value_entry is None or p.value_entry.status != "consumed")]
+
+    def get_pending_fuzzing_targets(self) -> list[EndpointParamRequirement]:
+        """Get endpoints that still need fuzzing/testing."""
+        # Return endpoints that haven't been fully tested
+        from core.linkage import ValueLinkageEngine
+        engine = ValueLinkageEngine()
+        result = engine.process_state(self)
+        if result.unconsumed_pairs > 0:
+            pairs = engine.get_unconsumed_pairs(self, limit=50)
+            # Convert pairs to endpoint requirements
+            endpoints = {}
+            for pair in pairs:
+                if pair.endpoint not in endpoints:
+                    endpoints[pair.endpoint] = EndpointParamRequirement(
+                        endpoint=pair.endpoint,
+                        method=pair.method,
+                        params_optional=[pair.param_name],
+                    )
+                else:
+                    if pair.param_name not in endpoints[pair.endpoint].params_optional:
+                        endpoints[pair.endpoint].params_optional.append(pair.param_name)
+            return list(endpoints.values())
+        return []
+
+    def should_transition(self, next_phase: PhaseName) -> bool:
+        """Determine if the hunt can transition to the next phase."""
+        from workflow.pipeline import get_phase
+
+        # Check if current phase dependencies are met
+        phase = get_phase(next_phase.value if isinstance(next_phase, str) else next_phase.value)
+        if not phase:
+            return False
+
+        # Check if all dependencies are completed
+        for dep in phase.depends_on:
+            dep_phase = PhaseName(dep) if isinstance(dep, str) else dep
+            if dep_phase not in self.completed_phases:
+                return False
+
+        # Phase-specific checks
+        if next_phase == PhaseName.API_FUZZ:
+            # Need endpoints and value linkage
+            return len(self.target.endpoints_discovered) > 0
+        elif next_phase == PhaseName.EXPLOIT:
+            # Need approved findings
+            return any(f.status == FindingStatus.TRIAGE_APPROVED for f in self.findings)
+
+        return True
+
+    def get_relevant_context(self, task: str) -> dict[str, Any]:
+        """Get context relevant to a specific task."""
+        context = {
+            "hunt_id": self.hunt_id,
+            "target": self.target.url,
+            "current_phase": self.current_phase.value,
+            "status": self.status.value,
+        }
+
+        # Task-specific context
+        task_lower = task.lower()
+        if "fuzz" in task_lower or "api" in task_lower:
+            context["endpoints"] = self.target.endpoints_discovered[:50]
+            context["tech_stack"] = self.target.tech_stack
+        elif "crypto" in task_lower or "jwt" in task_lower:
+            context["findings"] = [f for f in self.findings if "crypto" in f.vuln_class.lower() or "jwt" in f.vuln_class.lower()]
+        elif "bypass" in task_lower or "auth" in task_lower:
+            context["endpoints"] = [e for e in self.target.endpoints_discovered if "auth" in e.lower() or "login" in e.lower()]
+            context["findings"] = [f for f in self.findings if "auth" in f.vuln_class.lower()]
+
+        return context
+
+    def get_findings_by_severity(self, severity: Severity) -> list[Finding]:
+        """Get findings filtered by severity."""
+        return [f for f in self.findings if f.severity == severity]
+
+    def get_pending_findings(self) -> list[Finding]:
+        """Get findings that need triage."""
+        return [f for f in self.findings
+                if f.status in (FindingStatus.DETECTED, FindingStatus.TRIAGE_PENDING)]
+
+    def get_approved_findings(self) -> list[Finding]:
+        """Get findings that passed triage."""
+        return [f for f in self.findings
+                if f.status in (FindingStatus.TRIAGE_APPROVED, FindingStatus.POC_GENERATED)]
+
+    def add_finding(self, finding: Finding) -> None:
+        """Add a finding to the state."""
+        self.findings.append(finding)
+        self.touch()
+
+    def complete_phase(self, phase: PhaseName) -> None:
+        """Mark a phase as completed."""
+        if phase not in self.completed_phases:
+            self.completed_phases.append(phase)
+        self.current_phase = phase
+        self.touch()
+
+    def get_summary(self) -> str:
+        """Get a concise summary of the hunt state."""
+        parts = [
+            f"Hunt: {self.hunt_id}",
+            f"Target: {self.target.url}",
+            f"Phase: {self.current_phase.value}",
+            f"Status: {self.status.value}",
+            f"Findings: {len(self.findings)} ({sum(1 for f in self.findings if f.status == FindingStatus.TRIAGE_APPROVED)} approved)",
+            f"Endpoints: {len(self.target.endpoints_discovered)}",
+        ]
+        return " | ".join(parts)
 
 
 # ---------------------------------------------------------------------------
