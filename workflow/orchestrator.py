@@ -32,6 +32,8 @@ from workflow.state import (
 from core.agent_interface import AgentHooks, AgentContext, SkillResult, AgentExecutionStatus
 from core.linkage import ValueLinkageEngine, check_linkage_completeness
 from core.executors import ToolManager
+from core.ai_decision import AgentDecisionEngine, AIDecisionRequest, DecisionType
+from core.ai_modules import JSAnalyzer, EndpointPrioritizer, VulnerabilityMatcher
 
 
 class Orchestrator:
@@ -52,6 +54,7 @@ class Orchestrator:
         self.hooks = AgentHooks()
         self.tool_manager: ToolManager | None = None
         self.linkage_engine: ValueLinkageEngine | None = None
+        self.decision_engine: AgentDecisionEngine | None = None  # 新增
 
         # Phase 执行器映射
         self._phase_executors = {
@@ -101,6 +104,7 @@ class Orchestrator:
         # 初始化工具
         self.tool_manager = ToolManager(self.state)
         self.linkage_engine = ValueLinkageEngine()
+        self.decision_engine = AgentDecisionEngine(self.state)  # 新增
 
         # 设置 AI 决策回调
         if ai_decision_fn:

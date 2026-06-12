@@ -26,6 +26,7 @@ from dataclasses import dataclass
 from shared.types import HuntState
 from shared.utils import now_iso
 from shared.security import validate_target_url
+from core.ai_decision import AgentDecisionEngine, AIDecisionRequest, DecisionType
 
 
 @dataclass
@@ -105,7 +106,7 @@ class JSAnalyzer:
         r'Bearer\s+([A-Za-z0-9\-._~+/]+)',
     ]
 
-    def __init__(self, state: HuntState):
+    def __init__(self, state: HuntState, decision_engine: AgentDecisionEngine = None):
         """初始化 JS 分析器。"""
         self.state = state
         self.js_files: List[str] = []
@@ -113,6 +114,7 @@ class JSAnalyzer:
         self.secrets: List[JSSecret] = []
         self.api_calls: List[APICall] = []
         self.technologies: Dict[str, str] = {}
+        self.decision_engine = decision_engine  # 新增：决策引擎
 
     def collect_js_files(self) -> List[str]:
         """
@@ -391,49 +393,51 @@ class JSAnalyzer:
         """
         评估端点的攻击价值（优先级）。
 
-        这需要 AI 判断：
-        - 管理功能 > 普通功能
-        - 写操作 > 读操作
-        - 需要认证 > 公开接口
-        - 敏感参数 > 普通参数
+        通过 Hermes agent 决策或规则引擎 fallback。
         """
-        priority_score = 0
+        # 准备决策上下文
+        context = {
+            'endpoint': {
+                'url': url,
+                'method': method,
+                'params': params,
+                'requires_auth': requires_auth,
+            }
+        }
 
-        # URL 模式分析
+        # 创建决策请求
+        request = AIDecisionRequest(
+            decision_type=DecisionType.PRIORITY_ASSESSMENT,
+            context=context,
+        )
+
+        # 使用决策引擎（优先 agent，fallback 到规则）
+        if self.decision_engine:
+            decision = self.decision_engine.request_decision(request)
+            if decision.result:
+                return decision.result.get('priority', 'NORMAL')
+
+        # Fallback 到简单规则
+        return self._priority_fallback(url, method, params, requires_auth)
+
+    def _priority_fallback(self, url: str, method: str, params: List[str], requires_auth: bool) -> str:
+        """优先级评估的 fallback 规则。"""
+        priority_score = 0
         url_lower = url.lower()
 
-        # 高价值模式
-        if any(pattern in url_lower for pattern in ['admin', 'manage', 'config', 'settings']):
+        # 简化的规则
+        if any(p in url_lower for p in ['admin', 'manage', 'config']):
             priority_score += 3
-        elif any(pattern in url_lower for pattern in ['user', 'profile', 'account']):
+        if method in ['POST', 'PUT', 'DELETE']:
             priority_score += 2
-        elif any(pattern in url_lower for pattern in ['api', 'data', 'export']):
-            priority_score += 1
-
-        # 方法分析
-        if method in ['POST', 'PUT', 'DELETE', 'PATCH']:
-            priority_score += 2
-        elif method == 'GET':
-            priority_score += 0
-
-        # 认证要求
         if requires_auth:
             priority_score += 2
 
-        # 参数分析
-        sensitive_params = ['password', 'token', 'secret', 'key', 'credit', 'ssn']
-        if any(param in str(params).lower() for param in sensitive_params):
-            priority_score += 3
-
-        # 确定优先级
-        if priority_score >= 6:
+        if priority_score >= 5:
             return 'CRITICAL'
-        elif priority_score >= 4:
+        elif priority_score >= 3:
             return 'HIGH'
-        elif priority_score >= 2:
-            return 'NORMAL'
-        else:
-            return 'LOW'
+        return 'NORMAL'
 
     def _extract_secrets(self, content: str, source_file: str) -> List[Dict]:
         """提取敏感信息。"""
